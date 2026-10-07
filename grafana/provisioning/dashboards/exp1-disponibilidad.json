@@ -1,0 +1,175 @@
+{
+  "uid": "exp1-disponibilidad",
+  "title": "Experimento 1 - Disponibilidad (reservar_producto)",
+  "id": null,
+  "schemaVersion": 39,
+  "version": 3,
+  "editable": true,
+  "timezone": "browser",
+  "time": { "from": "now-15m", "to": "now" },
+  "refresh": "5s",
+  "panels": [
+    {
+      "id": 1,
+      "title": "TPS real (requests/seg)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": { "unit": "reqps" },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(rate(reserva_total_seconds_count[1m]))",
+          "legendFormat": "TPS procesado por reservar_producto"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Latencias p99 (deteccion / rollback / total) con umbrales",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": "Prometheus",
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "thresholdsStyle": { "mode": "line" } },
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "p99 deteccion" },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.15 }]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "p99 rollback" },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 0.2 }]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "p99 total" },
+            "properties": [
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [{ "color": "green", "value": null }, { "color": "purple", "value": 0.35 }]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.99, sum(rate(sanidad_deteccion_seconds_bucket[1m])) by (le))",
+          "legendFormat": "p99 deteccion"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.99, sum(rate(rollback_seconds_bucket[1m])) by (le))",
+          "legendFormat": "p99 rollback"
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "histogram_quantile(0.99, sum(rate(reserva_total_seconds_bucket[1m])) by (le))",
+          "legendFormat": "p99 total"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Distribucion deteccion (p50/p95/p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "datasource": "Prometheus", "expr": "histogram_quantile(0.50, sum(rate(sanidad_deteccion_seconds_bucket[1m])) by (le))", "legendFormat": "p50" },
+        { "datasource": "Prometheus", "expr": "histogram_quantile(0.95, sum(rate(sanidad_deteccion_seconds_bucket[1m])) by (le))", "legendFormat": "p95" },
+        { "datasource": "Prometheus", "expr": "histogram_quantile(0.99, sum(rate(sanidad_deteccion_seconds_bucket[1m])) by (le))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Distribucion rollback (p50/p95/p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "datasource": "Prometheus", "expr": "histogram_quantile(0.50, sum(rate(rollback_seconds_bucket[1m])) by (le))", "legendFormat": "p50" },
+        { "datasource": "Prometheus", "expr": "histogram_quantile(0.95, sum(rate(rollback_seconds_bucket[1m])) by (le))", "legendFormat": "p95" },
+        { "datasource": "Prometheus", "expr": "histogram_quantile(0.99, sum(rate(rollback_seconds_bucket[1m])) by (le))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Distribucion total end-to-end (p50/p95/p99)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "datasource": "Prometheus", "expr": "histogram_quantile(0.50, sum(rate(reserva_total_seconds_bucket[1m])) by (le))", "legendFormat": "p50" },
+        { "datasource": "Prometheus", "expr": "histogram_quantile(0.95, sum(rate(reserva_total_seconds_bucket[1m])) by (le))", "legendFormat": "p95" },
+        { "datasource": "Prometheus", "expr": "histogram_quantile(0.99, sum(rate(reserva_total_seconds_bucket[1m])) by (le))", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Pedidos: total vs procesados vs rechazados (en vivo)",
+      "type": "barchart",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "datasource": "Prometheus",
+      "fieldConfig": { "defaults": { "unit": "none" }, "overrides": [] },
+      "options": {
+        "orientation": "auto",
+        "showValue": "always",
+        "legend": { "displayMode": "list", "placement": "bottom" }
+      },
+      "targets": [
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(pedidos_confirmados_total) + sum(pedidos_rechazados_total)",
+          "legendFormat": "Total",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(pedidos_confirmados_total)",
+          "legendFormat": "Procesados (paso verificacion)",
+          "instant": true,
+          "range": false
+        },
+        {
+          "datasource": "Prometheus",
+          "expr": "sum(pedidos_rechazados_total)",
+          "legendFormat": "Rechazados (no paso verificacion)",
+          "instant": true,
+          "range": false
+        }
+      ]
+    }
+  ]
+}

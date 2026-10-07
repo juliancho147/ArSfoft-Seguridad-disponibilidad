@@ -1,0 +1,170 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: reto2
+      POSTGRES_USER: reto2
+      POSTGRES_PASSWORD: reto2
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reto2 -d reto2"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  seed:
+    build:
+      context: ./db
+      dockerfile: Dockerfile.seed
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: reto2
+      POSTGRES_USER: reto2
+      POSTGRES_PASSWORD: reto2
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  calculador_hash_integridad:
+    build: ./services/calculador_hash_integridad
+    ports:
+      - "8001:8000"
+
+  verificacion_sanidad:
+    build: ./services/verificacion_sanidad
+    environment:
+      DATABASE_URL: postgresql://reto2:reto2@postgres:5432/reto2
+    ports:
+      - "8002:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+
+  generar_pedido:
+    build: ./services/generar_pedido
+    environment:
+      DATABASE_URL: postgresql://reto2:reto2@postgres:5432/reto2
+      CALCULADOR_HASH_URL: http://calculador_hash_integridad:8000
+    ports:
+      - "8003:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+      calculador_hash_integridad:
+        condition: service_started
+
+  reservar_producto:
+    build: ./services/reservar_producto
+    environment:
+      DATABASE_URL: postgresql://reto2:reto2@postgres:5432/reto2
+      VERIFICACION_SANIDAD_URL: http://verificacion_sanidad:8000
+      GENERAR_PEDIDO_URL: http://generar_pedido:8000
+    ports:
+      - "8004:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      verificacion_sanidad:
+        condition: service_started
+      generar_pedido:
+        condition: service_started
+
+  detector_de_patrones_de_acceso:
+    build: ./services/detector_de_patrones_de_acceso
+    ports:
+      - "8005:8000"
+
+  componente_restauracion:
+    build: ./services/componente_restauracion
+    environment:
+      DATABASE_URL: postgresql://reto2:reto2@postgres:5432/reto2
+    ports:
+      - "8006:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+
+  gestor_bloqueo_cuentas:
+    build: ./services/gestor_bloqueo_cuentas
+    environment:
+      DATABASE_URL: postgresql://reto2:reto2@postgres:5432/reto2
+    ports:
+      - "8007:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+
+  verificador_integridad_hash:
+    build: ./services/verificador_integridad_hash
+    environment:
+      DATABASE_URL: postgresql://reto2:reto2@postgres:5432/reto2
+      CALCULADOR_HASH_URL: http://calculador_hash_integridad:8000
+      DETECTOR_PATRONES_URL: http://detector_de_patrones_de_acceso:8000
+      COMPONENTE_RESTAURACION_URL: http://componente_restauracion:8000
+      GESTOR_BLOQUEO_URL: http://gestor_bloqueo_cuentas:8000
+    ports:
+      - "8008:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      calculador_hash_integridad:
+        condition: service_started
+      detector_de_patrones_de_acceso:
+        condition: service_started
+      componente_restauracion:
+        condition: service_started
+      gestor_bloqueo_cuentas:
+        condition: service_started
+
+  modificar_pedido:
+    build: ./services/modificar_pedido
+    environment:
+      DATABASE_URL: postgresql://reto2:reto2@postgres:5432/reto2
+      VERIFICADOR_INTEGRIDAD_HASH_URL: http://verificador_integridad_hash:8000
+    ports:
+      - "8009:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+      verificador_integridad_hash:
+        condition: service_started
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  pgdata:

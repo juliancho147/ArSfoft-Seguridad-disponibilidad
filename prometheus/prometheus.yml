@@ -1,0 +1,39 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: reservar_producto
+    static_configs:
+      - targets: ["reservar_producto:8000"]
+
+  - job_name: verificacion_sanidad
+    static_configs:
+      - targets: ["verificacion_sanidad:8000"]
+
+  - job_name: generar_pedido
+    static_configs:
+      - targets: ["generar_pedido:8000"]
+
+  - job_name: calculador_hash_integridad
+    static_configs:
+      - targets: ["calculador_hash_integridad:8000"]
+
+  - job_name: modificar_pedido
+    static_configs:
+      - targets: ["modificar_pedido:8000"]
+
+  - job_name: verificador_integridad_hash
+    static_configs:
+      - targets: ["verificador_integridad_hash:8000"]
+
+  - job_name: detector_de_patrones_de_acceso
+    static_configs:
+      - targets: ["detector_de_patrones_de_acceso:8000"]
+
+  - job_name: componente_restauracion
+    static_configs:
+      - targets: ["componente_restauracion:8000"]
+
+  - job_name: gestor_bloqueo_cuentas
+    static_configs:
+      - targets: ["gestor_bloqueo_cuentas:8000"]
