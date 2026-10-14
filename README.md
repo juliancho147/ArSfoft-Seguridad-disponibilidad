@@ -4,8 +4,8 @@ Implementación de los dos experimentos de validación arquitectónica definidos
 bitácora del Reto 2 (ARTI4109): uno para el atributo de calidad **Disponibilidad**
 (`reservar_producto`) y otro para **Seguridad** (`modificar_pedido`, escenario de
 tampering). El análisis completo (ASRs, hipótesis, justificación de tácticas,
-diagramas) vive en `../bitacora-reto2.md` y `../plan-implementacion-experimentos-reto2.md`;
-este documento cubre **cómo está construido y cómo correrlo**.
+diagramas) vive en el documento de arquitectura del Reto 2 (la bitácora, que no está
+en este repositorio); este documento cubre **cómo está construido y cómo correrlo**.
 
 Stack: Python (FastAPI) para todos los servicios, Postgres, Prometheus + Grafana
 para métricas, k6 para generar carga. Todo corre en Docker Compose para desarrollo
@@ -25,15 +25,26 @@ inconsistencia se origina en una condición de carrera real.
 
 **Tácticas**: Verificación de sanidad (detección) + Rollback (recuperación).
 
-**Cómo se produce la condición de carrera**: el catálogo semilla tiene 30 productos
-con stock alto (5000 unidades) y 4 con stock bajo (5-10 unidades). Bajo carga
-concurrente sobre los productos de bajo stock, `verificacion_sanidad` hace un
-decremento atómico **sin guarda** (`UPDATE producto SET stock = stock - :cantidad
-... RETURNING stock`, sin `WHERE stock >= cantidad`). Esto deja que la sobreventa
-ocurra de forma natural bajo concurrencia real (tal como pide la bitácora: no se
-diseñó un mecanismo de control de concurrencia dedicado). Si el stock resultante
-queda negativo, `reservar_producto` hace rollback (revierte el decremento) y
-rechaza la reserva; si no, confirma el pedido.
+**Cómo se produce la condición de carrera**: `reservar_producto` sigue el diagrama
+de secuencia tal cual — `get_stock` (lee stock real y cantidad ya reservada),
+`calcular_reserva` (si lo disponible no alcanza, rechaza por falta de stock) y
+`save_reserva` (persiste la reserva y acumula `producto.reservado`). Ese
+check-then-act **no tiene control de concurrencia** (intencional: la bitácora no
+diseña un componente para eso) y hay 8 workers consumiendo la cola, así que dos
+solicitudes simultáneas sobre el mismo producto leen el mismo disponible y ambas
+reservan: la cantidad reservada acumulada queda por encima del stock real.
+
+**Detección**: `verificacion_sanidad` solo lee de la base (`reserva.reservado_acumulado`
+vs `producto.stock`), compara, y si no cuadra marca la reserva como `erronea`.
+
+**Recuperación**: `reservar_producto` revierte la reserva en una sola transacción
+(devuelve las unidades y deja la reserva en `revertida`) y responde el rechazo.
+Lo mismo ocurre si `generar_pedido` falla después de reservar: no queda stock
+comprometido sin pedido.
+
+Hay entonces dos tipos de rechazo: el **normal** (no había unidades al calcular;
+no es una falla) y el de **reserva errónea** (falla por carrera, detectada y
+revertida). Solo el segundo es el objeto del experimento.
 
 ### Experimento 2 — Seguridad (`modificar_pedido`, Tampering-Tendero)
 
@@ -53,8 +64,17 @@ cuenta (reacción).
    modificación cambia precio/cantidad, así que el hash casi siempre difiere).
 2. **Hash no coincide Y patrón normal** → corrección legítima: se recalcula y
    actualiza el hash (nueva línea base), se confirma sin alerta.
-3. **Hash no coincide Y patrón anómalo** → tampering: se dispara la reacción
-   completa (restaura el pedido al valor original + bloquea la cuenta).
+3. **Hash no coincide Y patrón anómalo** → tampering: se genera la alerta de
+   seguridad (registro `alerta_tampering` en el audit trail + log
+   `ALERTA_SEGURIDAD`) y se dispara la reacción completa (restaura el pedido al
+   valor original + bloquea la cuenta), que queda registrada como
+   `reaccion_tampering`.
+
+La restauración usa el registro de auditoría **de esa solicitud** (`auditoria_id`),
+no "el último del pedido", y `modificar_pedido` serializa por pedido todo el ciclo
+modificación → verificación → reacción (advisory lock de Postgres), para que dos
+modificaciones simultáneas al mismo pedido no se crucen. Una cuenta bloqueada
+recibe `403` en su siguiente intento.
 
 **El mock**: `detector_de_patrones_de_acceso` no implementa un algoritmo real de
 anomalías (fuera de alcance del reto). Recibe una etiqueta de prueba
@@ -70,10 +90,10 @@ algoritmo de detección real.
 
 | Servicio | Puerto host | Responsabilidad | Experimento |
 |---|---|---|---|
-| `reservar_producto` | 8004 | Ingreso (`POST /reservas`) + cola in-memory + orquestación (sanidad → generar_pedido \| rollback) | 1 |
-| `verificacion_sanidad` | 8002 | Decremento atómico de stock + comparación (detección) | 1 |
+| `reservar_producto` | 8004 | Ingreso (`POST /reservas`) + cola in-memory + 8 workers: get_stock → calcular_reserva → save_reserva → sanidad → generar_pedido \| rollback | 1 |
+| `verificacion_sanidad` | 8002 | Lee reservado vs stock real, compara y marca la reserva errónea (detección) | 1 |
 | `generar_pedido` | 8003 | Crea el pedido confirmado, pide el hash, hace el INSERT | 1 |
-| `modificar_pedido` | 8009 | Ingreso (`POST /modificar`): aplica el UPDATE, registra auditoría, delega la verificación | 2 |
+| `modificar_pedido` | 8009 | Ingreso (`POST /modificar`): rechaza cuentas bloqueadas, registra auditoría, aplica el UPDATE, delega la verificación | 2 |
 | `verificador_integridad_hash` | 8008 | Orquesta hash + patrón de acceso, decide las 3 ramas, dispara la reacción | 2 |
 | `detector_de_patrones_de_acceso` | 8005 | Mock: devuelve la etiqueta `patron_simulado` recibida | 2 |
 | `componente_restauracion` | 8006 | Revierte un pedido a su valor original | 2 |
@@ -85,16 +105,23 @@ algoritmo de detección real.
 
 **Decisión no obvia**: `cola_de_reserva_producto` (el componente de cola del
 diagrama de arquitectura) y `reservar_producto` corren en el **mismo contenedor**.
-La cola elegida es `asyncio.Queue` in-memory, que no se puede compartir entre
-procesos distintos sin un broker externo (Redis, SQS...); el endpoint `POST
-/reservas` hace de cola de ingreso y una corrutina interna hace de worker.
+La cola elegida es `asyncio.Queue` in-memory (el diagrama de despliegue propone
+Kafka), que no se puede compartir entre procesos distintos sin un broker externo;
+el endpoint `POST /reservas` hace de cola de ingreso y `N_WORKERS` corrutinas
+(8 por defecto) hacen de workers concurrentes.
 
 ### Modelo de datos (una sola base Postgres — ver `db/init.sql`)
 
-- `producto(producto_id, stock, precio)` — catálogo.
+- `producto(producto_id, stock, reservado, precio)` — catálogo. `stock` es el stock
+  real; `reservado` la cantidad reservada acumulada. Invariante: `reservado <= stock`.
+- `reserva(id, producto_id, tendero_id, cantidad, reservado_acumulado, estado, pedido_id,
+  creada_en, detectada_en, revertida_en)` — estados `pendiente → confirmada` o
+  `pendiente → erronea → revertida`. Los timestamps permiten auditar el experimento
+  directamente en la base.
 - `pedido(id, tendero_id, producto_id, cantidad, precio, estado, hash_integridad, fecha_creacion)`.
 - `registro_auditoria(id, pedido_id, actor_id, ts, valor_anterior, valor_nuevo, tipo)` —
-  usado por `verificador_integridad_hash` para saber a qué valor restaurar.
+  tipos `intento_modificacion`, `alerta_tampering`, `reaccion_tampering`. Es
+  inmutable: un trigger rechaza `UPDATE` y `DELETE`.
 - `cuenta(actor_id, bloqueada)`.
 
 `precio` usa `NUMERIC(12,2)` a propósito (no `NUMERIC` sin precisión): evita que
@@ -112,15 +139,22 @@ para este componente — ver bitácora sección 6, pestaña "Despliegue UML - Ve
 
 | Métrica | Tipo | Servicio | Umbral del ASR |
 |---|---|---|---|
-| `sanidad_deteccion_seconds` | Histogram | `verificacion_sanidad` | p99 < 150ms |
+| `sanidad_deteccion_seconds{resultado}` | Histogram | `verificacion_sanidad` | p99 < 150ms (`resultado="erronea"`) |
 | `rollback_seconds` | Histogram | `reservar_producto` | p99 < 200ms |
-| `reserva_total_seconds` | Histogram | `reservar_producto` | p99 < 350ms |
+| `reserva_total_seconds` | Histogram | `reservar_producto` | p99 < 350ms (incluye espera en cola) |
+| `reservas_erroneas_detectadas_total` | Counter | `verificacion_sanidad` | debe igualar a las revertidas |
+| `reservas_revertidas_total` / `reservas_sin_stock_total` | Counter | `reservar_producto` | — |
 | `pedidos_confirmados_total` / `pedidos_rechazados_total` | Counter | `reservar_producto` | — (conteo) |
-| `hash_deteccion_seconds` | Histogram | `verificador_integridad_hash` | p99 < 150ms |
-| `patron_deteccion_seconds` | Histogram | `verificador_integridad_hash` | p99 < 150ms (parte de detección) |
+| `tampering_deteccion_seconds{rama}` | Histogram | `verificador_integridad_hash` | p99 < 150ms (`rama="tampering"`) |
+| `hash_deteccion_seconds` / `patron_deteccion_seconds` | Histogram | `verificador_integridad_hash` | — (desglose de la detección) |
 | `reaccion_seconds` | Histogram | `verificador_integridad_hash` | p99 < 200ms desde la alerta |
 | `tampering_total_seconds` | Histogram | `modificar_pedido` | p99 < 350ms |
-| `hash_coincide_total` / `correcciones_legitimas_total` / `alertas_generadas_total` | Counter | `verificador_integridad_hash` | — (conteo por rama) |
+| `hash_coincide_total` / `correcciones_legitimas_total` / `alertas_generadas_total` / `reacciones_completadas_total` | Counter | `verificador_integridad_hash` | — (conteo por rama) |
+| `intentos_cuenta_bloqueada_total` | Counter | `modificar_pedido` | — |
+
+Todos los histogramas tienen fronteras de bucket exactamente en 150, 200 y 350 ms
+(con los buckets por defecto de `prometheus_client` no hay frontera en esos valores
+y `histogram_quantile` interpola justo donde se decide el experimento).
 
 Los umbrales se validan contra **estas métricas de negocio en Prometheus**, no
 contra el tiempo de red que mide k6 — k6 solo confirma que el servicio responde
@@ -135,7 +169,7 @@ bajo carga sostenida.
   ver [instrucciones oficiales](https://grafana.com/docs/k6/latest/set-up/install-k6/)
   para Linux/Windows.
 - Opcional: cliente `psql` para inspeccionar la base de datos directamente
-  (también se puede usar `docker exec implementacion-postgres-1 psql -U reto2 -d reto2`).
+  (también se puede usar `docker compose exec postgres psql -U reto2 -d reto2`).
 
 ---
 
@@ -144,7 +178,6 @@ bajo carga sostenida.
 ### 4.1 Levantar el stack
 
 ```bash
-cd implementacion
 docker compose up -d --build
 ```
 
@@ -176,26 +209,46 @@ curl -s -X POST http://localhost:8009/modificar -H 'Content-Type: application/js
 ```bash
 curl -s -X POST http://localhost:8009/modificar -H 'Content-Type: application/json' \
   -d '{"pedido_id":"ped-seed-0002","precio_nuevo":1,"cantidad_nuevo":999,"actor_id":"tendero-seed-0002","patron_simulado":"anomalo"}'
-# -> {"estado":"revertido","rama":"tampering"} y la cuenta queda bloqueada
+# -> {"estado":"revertido","rama":"tampering"} y la cuenta queda bloqueada:
+#    repetir el mismo curl responde 403 "cuenta bloqueada"
 ```
 
 (Usa cualquier `pedido_id`/`tendero_id` de la tabla `pedido` semilla —
 `ped-seed-0001` .. `ped-seed-0300`.)
 
-### 4.3 Generar carga con k6 (Experimento 1)
+### 4.3 Generar carga con k6
 
 ```bash
-# Corrida corta de validación (1 min) — confirma que el pipeline responde
-k6 run --env DURATION=1m --env RATE=30 k6/exp1_reserva.js
+# Corrida corta de validación (1 min)
+k6 run --env DURATION=1m k6/exp1_reserva.js
+k6 run --env DURATION=1m k6/exp2_tampering.js
 
-# Corrida oficial (10 min, 30 TPS, igual que el ASR). En Mac, usa caffeinate
+# Corridas oficiales (10 min, 30 TPS, igual que los ASR). En Mac, usa caffeinate
 # para que el sistema no entre en reposo a mitad de la prueba:
-caffeinate -dis k6 run --env DURATION=10m --env RATE=30 \
-  --summary-export=k6/results/mi_corrida.json k6/exp1_reserva.js
+caffeinate -dis k6 run --env DURATION=10m --summary-export=k6/results/exp1.json k6/exp1_reserva.js
+caffeinate -dis k6 run --env DURATION=10m --summary-export=k6/results/exp2.json k6/exp2_tampering.js
 ```
 
-> El Experimento 2 todavía no tiene script k6 propio (ver sección 6 "Qué falta").
-> Hasta entonces, su carga se puede probar manualmente con los `curl` de arriba.
+Resetear los datos (4.5) entre un experimento y otro.
+
+**Experimento 1**: cada iteración envía una ráfaga de 2 solicitudes simultáneas
+sobre el mismo producto (15 iteraciones/s = 30 TPS). Con llegadas espaciadas
+uniformemente cada reserva termina antes de que llegue la siguiente y la carrera
+nunca ocurre. Un segundo escenario llama cada 5 s a `POST /_test/reponer`, que
+repone los 4 productos de bajo stock a 5-10 unidades disponibles; sin eso se
+agotan en los primeros segundos y no hay más contención en el resto de la corrida.
+
+**Experimento 2**: 80% `normal` (el dueño del pedido) / 20% `anomalo`. Cada
+solicitud anómala usa una cuenta distinta, y un 10% reintenta con la misma cuenta
+para comprobar que el bloqueo responde `403`. El script falla si hay algún falso
+positivo, algún tampering sin revertir o algún bloqueo sin efecto.
+
+Al terminar cada corrida, verificar contra la base:
+
+```bash
+docker compose exec -T postgres psql -U reto2 -d reto2 < db/verificar_exp1.sql
+docker compose exec -T postgres psql -U reto2 -d reto2 < db/verificar_exp2.sql
+```
 
 ### 4.4 Ver los dashboards en vivo
 
@@ -203,7 +256,8 @@ Abrir **mientras hay tráfico corriendo** (los paneles usan `rate()`, así que s
 no hay tráfico reciente dentro de la ventana de tiempo se ven en blanco):
 
 ```
-http://localhost:3000/d/exp1-disponibilidad/experimento-1-disponibilidad-reservar-producto
+http://localhost:3000/d/exp1-disponibilidad
+http://localhost:3000/d/exp2-seguridad
 ```
 
 Usuario anónimo habilitado (no pide login). El dashboard trae: TPS real,
@@ -225,33 +279,48 @@ contadores también quedan en cero).
 
 ---
 
-## 5. Resultado de referencia (última corrida oficial validada)
+## 5. Resultados
 
-Experimento 1, 10 minutos, 30 TPS, 18.000 requests, 0% fallos HTTP:
+### Experimento 1 — corrida oficial (11 de octubre de 2026, 10 min, 30 TPS, local)
 
-| Métrica | Umbral | Resultado (p99) |
+| Métrica | Objetivo | Resultado |
 |---|---|---|
-| Detección | <150ms | 4.95 ms |
-| Rollback | <200ms | 4.95 ms |
-| Total end-to-end | <350ms | 15.41 ms |
-| Reservas erróneas revertidas | 100% | 100% (0 productos con stock negativo) |
+| Detección p99 (reservas erróneas) | <150ms | 4.6 ms en el servicio; 8.3 ms medido en la base (máx. 30.8 ms) |
+| Rollback p99 | <200ms | 12.4 ms en el servicio; 17.0 ms medido en la base (máx. 20.8 ms) |
+| Total end-to-end p99 (incluye cola) | <350ms | 37.2 ms |
+| Reservas erróneas revertidas | 100% | 168 de 168 |
+| Pedidos confirmados con reserva inválida | 0 | 0 |
 
-El Experimento 2 está validado funcionalmente (las 3 ramas se comportan como
-describe la bitácora) pero todavía no tiene una corrida de carga oficial de 10 min
-— ver sección 6.
+18.000 reservas a 30.2 TPS reales: 16.931 confirmadas, 901 rechazos normales por
+falta de stock y 168 reservas erróneas por condición de carrera. 37 solicitudes
+(0.2%) superaron los 350 ms; por ventanas de 1 minuto el p99 total tuvo dos picos
+(~280 ms hacia el minuto 2 y 470-590 ms en el cierre), de causa no identificada.
+Una de las 120 llamadas a `/_test/reponer` falló; ninguna reserva falló.
+
+Ambiente: MacBook Air M2 (8 núcleos, 16 GB), Docker Desktop con 8 CPU y 8.2 GB,
+k6 2.2.0 en la misma máquina. Los resultados anteriores de este README (p99 de
+4.95 ms) correspondían a una versión que procesaba las reservas en serie, sin
+condición de carrera, y se retiraron.
+
+### Experimento 2 — pendiente de corrida oficial
+
+Prueba de humo de 60 s a 30 TPS (no reemplaza la corrida oficial): 1.800
+modificaciones, 1.466 correcciones legítimas sin alerta (0 falsos positivos), 334
+tampering con 334 alertas y 334 reacciones; 97/97 reintentos con cuenta bloqueada
+respondieron 403. Detección p99 ≈ 9 ms, reacción p99 ≈ 10 ms, total p99 ≈ 24 ms.
 
 ---
 
 ## 6. Qué falta (estado actual)
 
-- [x] Experimento 1: servicios, instrumentación, dashboard Grafana, script k6,
-      corrida oficial de 10 min validada.
-- [x] Experimento 2: servicios, instrumentación, 3 ramas validadas manualmente.
-- [ ] Experimento 2: script k6 (carga con etiqueta `patron_simulado`, 88%
-      normal / 12% anómalo, según bitácora 7.3) y dashboard Grafana propio.
+- [x] Experimento 1: servicios, instrumentación, dashboard Grafana, script k6.
+- [x] Experimento 2: servicios, instrumentación, dashboard Grafana, script k6.
+- [x] Experimento 1: corrida oficial de 10 min (ver sección 5).
 - [ ] Experimento 2: corrida oficial de 10 min.
-- [ ] Despliegue en nube (EKS) — ver sección 7, decisión explícita de dejarlo
-      para después de validar todo en local.
+- [ ] Despliegue en nube (EKS) — ver sección 7.
+- [ ] Fuera de este experimento pero presentes en la arquitectura: API Gateway,
+      Kafka como cola, el Lambda verificador de hashes y TLS/mTLS entre servicios
+      (hoy todo el tráfico interno es HTTP plano).
 
 ---
 
@@ -302,10 +371,18 @@ Para que cualquiera que retome esto no se sorprenda:
 - **Cola in-memory, no Redis**: `cola_de_reserva_producto` y `reservar_producto`
   comparten proceso por esto (ver sección 2). Si se cambia a un broker real
   (Redis/SQS), se pueden separar en dos contenedores.
-- **Decremento de stock sin guarda de concurrencia**: es intencional (así se
+- **`calcular_reserva` sin control de concurrencia**: es intencional (así se
   produce la condición de carrera real que exige el Experimento 1 — no es un bug).
-- **`stock` de productos "normales" en 5000, no 500**: el valor original de la
-  bitácora (500) no alcanzaba a sostener 30 TPS/10min sin que *todo* el catálogo
+- **La detección es conservadora**: una reserva se marca errónea si el acumulado
+  que ella misma persistió supera el stock, aunque otra reserva del mismo choque
+  esté por revertirse. Nunca se confirma de más; a veces se rechaza una reserva
+  que habría cabido tras el rollback de la otra.
+- **`POST /_test/reponer` y `patron_simulado`** son soporte de prueba, no parte
+  del contrato real. El endpoint solo existe con `ENABLE_TEST_ENDPOINTS=true`.
+- **`actor_id` llega en el cuerpo de la solicitud**: no hay autenticación ni se
+  valida que el actor sea dueño del pedido (Resistir está fuera de alcance).
+- **`stock` de productos "normales" en 5000, no 500**: el valor de la
+  bitácora (500, **pendiente de actualizar allá**) no alcanzaba a sostener 30 TPS/10min sin que *todo* el catálogo
   se agotara, no solo los 4 productos de bajo stock. Se subió a 5000 (margen ~3x
   sobre la demanda esperada) para que el comportamiento observado corresponda al
   que describe la bitácora 7.2.
@@ -326,10 +403,6 @@ Para que cualquiera que retome esto no se sorprenda:
 
 ## 9. Referencias
 
-- `../bitacora-reto2.md` — ASRs completos (fuente, estímulo, respuesta, medida de
-  respuesta), justificación de cada táctica, histórico de decisiones y
-  correcciones.
-- `../plan-implementacion-experimentos-reto2.md` — plan original de
-  implementación de ambos experimentos.
-- `../componentes-reto2.drawio` — diagramas UML (componentes, secuencia,
-  clases, despliegue agnóstico y despliegue AWS-nativo).
+- Documento de arquitectura "Reto 2: Disponibilidad y Seguridad — Sistema CCP"
+  (bitácora): ASRs, vistas, decisiones y planeación de los experimentos. No está
+  versionado en este repositorio.

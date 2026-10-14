@@ -2,7 +2,7 @@
 Seed de datos para los experimentos 7.2 (Disponibilidad) y 7.3 (Seguridad).
 
 Exp. 1 (reservar_producto):
-  - 30 productos stock=500 (prod-normal-01..30)
+  - 30 productos stock=5000 (prod-normal-01..30; ver STOCK_NORMAL)
   - 4 productos stock aleatorio 5-10 (prod-bajo-01..04)
 
 Exp. 2 (modificar_pedido):
