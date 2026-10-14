@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:16-alpine
@@ -70,6 +68,9 @@ services:
       DATABASE_URL: postgresql://reto2:reto2@postgres:5432/reto2
       VERIFICACION_SANIDAD_URL: http://verificacion_sanidad:8000
       GENERAR_PEDIDO_URL: http://generar_pedido:8000
+      N_WORKERS: "8"
+      # habilita POST /_test/reponer (reposicion de productos de bajo stock durante la carga)
+      ENABLE_TEST_ENDPOINTS: "true"
     ports:
       - "8004:8000"
     depends_on:
@@ -159,6 +160,8 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: admin
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      # permite refresco de 1s (cronometro del dashboard)
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: 1s
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning
     ports:
